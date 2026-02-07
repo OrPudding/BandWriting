@@ -77,7 +77,7 @@
 </style>
 
 <script>
-import rawModel from "../../../models/tiny36_int8_array.json"
+import rawModel from "../../../models/tiny36_14_int8_array.json"
 import prompt from "@system.prompt"
 import brightness from "@system.brightness"
 
@@ -101,29 +101,41 @@ export default {
 
     // ===== 结果 =====
     result: "",
+    inferMs: 0, // <-- 保存纯推理耗时（ms）
 
     // ===== 模型 =====
     model: null,
     layers: null,
 
-    // ===== 推理缓存（避免频繁 new/GC）=====
-    inputBuf: null, // 28*28
-    buf16_28: null, // 16*28*28
-    buf16_14: null, // 16*14*14
-    buf32_14: null, // 32*14*14
-    buf32_7: null, // 32*7*7
-    buf128: null, // 128
-    buf36: null // 36
+    // ===== 推理缓存 =====
+    input28: null, // Float32 28*28（镜像后）
+    input14: null, // Float32 14*14（由28降采样）
+    buf16_14: null, // 16*14*14 (conv1 out)
+    buf16_7: null, // 16*7*7   (pool1 out)
+    buf32_7: null, // 32*7*7   (conv2 out)
+    buf32_3: null, // 32*3*3   (pool2 out, floor)
+    buf128: null,
+    buf36: null,
+
+    autoMs: 2000, // 3s
+    autoTimer: 0, // timeout id
+    autoArmed: false, // 已经安排了自动识别
+    autoEnabled: true, // 开关
+    isInferring: false // 防重入
   },
 
   onInit() {
-    brightness.setKeepScreenOn({keepScreenOn: true})
+    // 有的设备没 brightness，别让它直接把页面搞死
+    try {
+      brightness.setKeepScreenOn({keepScreenOn: true})
+    } catch (e) {}
 
     const m = rawModel && rawModel.default ? rawModel.default : rawModel
     this.model = m
     const layers = m && m.layers ? m.layers : []
     this.layers = layers
 
+    // ===== 预处理权重：conv2 用 wf；conv1/fc 用 Int16Array w_q + scale =====
     for (let i = 0; i < layers.length; i++) {
       const L = layers[i]
       if (!L) continue
@@ -137,20 +149,19 @@ export default {
       }
 
       if (L.type === "conv2d") {
-        // 只给 conv2 做 wf（conv1 还用 w_q，否则会变 0）
         if (L.name === "conv2") {
+          // conv2: wf (Float32Array), 然后清 w_q 省内存
           if (!L.wf) {
             const wsrc = L.w_q || []
             const ws = +L.w_scale
             const wf = new Float32Array(wsrc.length)
             for (let j = 0; j < wf.length; j++) wf[j] = (wsrc[j] | 0) * ws
             L.wf = wf
-            // conv2 清掉 w_q，省内存
             L.w_q = null
             L.w_scale = 1.0
           }
         } else {
-          // conv1：保留 w_q（并转 Int16Array 提速）
+          // conv1: 保留 w_q (Int16Array) + w_scale
           if (!(L.w_q instanceof Int16Array)) {
             const src = L.w_q || []
             const wq = new Int16Array(src.length)
@@ -160,7 +171,6 @@ export default {
           L.w_scale = +L.w_scale
         }
       } else if (L.type === "fc") {
-        // fc 不生成 wf：w_q -> Int16Array（省内存）
         if (!(L.w_q instanceof Int16Array)) {
           const src = L.w_q || []
           const wq = new Int16Array(src.length)
@@ -173,20 +183,24 @@ export default {
       }
     }
 
-    // ===== 关键优化 2：预分配所有中间 buffer（infer 不再 new）=====
-    this.inputBuf = new Float32Array(28 * 28)
-    this.buf16_28 = new Float32Array(16 * 28 * 28)
+    // ===== buffers =====
+    this.input28 = new Float32Array(28 * 28)
+    this.input14 = new Float32Array(14 * 14)
+
     this.buf16_14 = new Float32Array(16 * 14 * 14)
-    this.buf32_14 = new Float32Array(32 * 14 * 14)
+    this.buf16_7 = new Float32Array(16 * 7 * 7)
     this.buf32_7 = new Float32Array(32 * 7 * 7)
+    this.buf32_3 = new Float32Array(32 * 3 * 3)
     this.buf128 = new Float32Array(128)
     this.buf36 = new Float32Array(36)
-    console.log("layers type:", typeof this.layers)
-    console.log("isArray:", Array.isArray(this.layers))
+
+    console.log("layers ok:", Array.isArray(this.layers), this.layers && this.layers.length)
   },
 
   onDestroy() {
-    brightness.setKeepScreenOn({keepScreenOn: false})
+    try {
+      brightness.setKeepScreenOn({keepScreenOn: false})
+    } catch (e) {}
   },
 
   // ============ UI ============
@@ -196,35 +210,52 @@ export default {
     this.showGrid = false
     this.drawing = false
     this.result = ""
+    this.inferMs = 0
   },
 
   onBackPress() {
-    if (this.showGrid) {
-      this.showGrid = false
+    if (!this.showGrid) {
       return true
     }
     return false
   },
 
   done() {
-    prompt.showToast({message: "正在识别..."})
+    // 手动 done：先取消自动识别，避免重复触发
+    this.cancelAutoInfer()
+    if (this.isInferring) return
+    if (!this.hasInk()) {
+      this.result = ""
+      return
+    }
+
+    // 预览（你要性能就把这块关掉）
     const arr = []
     for (let i = 0; i < 784; i++) arr.push({on: this.grid[i] ? true : false})
     this.preview = arr
     this.showGrid = true
+    prompt.showToast({message: "正在识别..."})
 
+    this.isInferring = true
     const t0 = Date.now()
     const idx = this.infer()
-    const ch = this.idxToChar(idx)
     const ms = Date.now() - t0
+    this.inferMs = ms
+    const ch = this.idxToChar(idx)
     this.result = ch + "," + ms + "ms"
-    console.log("result:", this.result)
+    this.isInferring = false
+
+    console.log("result:", this.result, "inferMs:", this.inferMs)
   },
 
   // ============ 采集 ============
   onDown(e) {
     if (this.showGrid) return
     if (!e.changedTouches || !e.changedTouches.length) return
+
+    // 开始写：取消自动识别计时（防止刚落笔就触发）
+    this.cancelAutoInfer()
+
     const t = e.changedTouches[0]
     this.drawing = true
     this.lastX = t.offsetX
@@ -246,10 +277,16 @@ export default {
     this.drawLine(this.lastX, this.lastY, t.offsetX, t.offsetY)
     this.lastX = t.offsetX
     this.lastY = t.offsetY
+
+    // 每次有效 move 都重置“停笔 3s 自动识别”
+    // 这里先不触发，因为 drawing=true；但会取消旧 timer
+    this.cancelAutoInfer()
   },
 
   onUp() {
     this.drawing = false
+    // 抬笔后开始倒计时 3s：如果用户不继续写就自动识别
+    this.armAutoInfer()
   },
 
   drawPoint(x, y) {
@@ -285,43 +322,110 @@ export default {
     }
   },
 
-  // ============ 推理（优化版：wf/b typed + buffer 复用）===========
-  gridToInputFloat() {
-    const out = this.inputBuf
+  armAutoInfer() {
+    if (!this.autoEnabled) return
+    // 有些环境 clearTimeout 对 0 也没事
+    if (this.autoTimer) {
+      clearTimeout(this.autoTimer)
+      this.autoTimer = 0
+    }
+    this.autoArmed = true
+    const self = this
+    this.autoTimer = setTimeout(function () {
+      self.autoTimer = 0
+      if (!self.autoEnabled) return
+      if (self.showGrid || self.isInferring || self.drawing) return
+      if (!self.hasInk()) return
+
+      self.done() // <-- 自动也做预览+toast+识别
+    }, this.autoMs)
+  },
+
+  cancelAutoInfer() {
+    if (this.autoTimer) {
+      clearTimeout(this.autoTimer)
+      this.autoTimer = 0
+    }
+    this.autoArmed = false
+  },
+
+  hasInk() {
+    // 784 扫一遍很快（比推理小太多）
+    const g = this.grid
+    for (let i = 0; i < 784; i++) if (g[i]) return true
+    return false
+  },
+
+  autoDone() {
+    // 自动识别：默认不弹 toast、不切预览（省 UI 开销）
+    this.isInferring = true
+    const t0 = Date.now()
+    const idx = this.infer()
+    const ms = Date.now() - t0
+    this.inferMs = ms
+    const ch = this.idxToChar(idx)
+    this.result = ch + "," + ms + "ms(auto)"
+    this.isInferring = false
+  },
+
+  // ============ 预处理：28(镜像) -> 14（2x2 maxpool/OR）===========
+  gridTo28FloatMirrored() {
+    const out = this.input28
     const g = this.grid
     const N = 28
     for (let y = 0; y < N; y++) {
       const row = y * N
       for (let x = 0; x < N; x++) {
-        // 水平翻转：x -> N-1-x
         out[row + x] = g[row + (N - 1 - x)] ? 1.0 : 0.0
       }
     }
     return out
   },
 
+  down28to14_avg(in28, out14) {
+    let oi = 0
+    for (let y = 0; y < 14; y++) {
+      const y2 = y << 1
+      const row0 = y2 * 28
+      const row1 = (y2 + 1) * 28
+      for (let x = 0; x < 14; x++) {
+        const x2 = x << 1
+        let s = 0
+        if (in28[row0 + x2] > 0) s++
+        if (in28[row0 + x2 + 1] > 0) s++
+        if (in28[row1 + x2] > 0) s++
+        if (in28[row1 + x2 + 1] > 0) s++
+        // 输出灰度：0,0.25,0.5,0.75,1.0
+        out14[oi++] = s * 0.25
+      }
+    }
+    return out14
+  },
+
+  // ============ 推理（14x14 模型）===========
   infer() {
     const layers = this.layers
     if (!layers || !layers.length) return 0
 
-    const x0 = this.gridToInputFloat()
+    const x28 = this.gridTo28FloatMirrored()
+    const x14 = this.down28to14_avg(x28, this.input14)
 
-    // conv1+relu -> buf16_28
-    this.conv2d_relu_into_1c(x0, 28, 28, layers[0], this.buf16_28)
+    // conv1 (1x14x14) -> 16x14x14
+    this.conv2d_relu_into_1c(x14, 14, 14, layers[0], this.buf16_14)
 
-    // pool1 -> buf16_14
-    this.maxpool2d_into(this.buf16_28, 16, 28, 28, this.buf16_14)
+    // pool1 -> 16x7x7
+    this.maxpool2d_into(this.buf16_14, 16, 14, 14, this.buf16_7)
 
-    // conv2+relu -> buf32_14
-    this.conv2_fast_14(this.buf16_14, layers[2], this.buf32_14)
+    // conv2 (16x7x7) -> 32x7x7
+    this.conv2_fast_7(this.buf16_7, layers[2], this.buf32_7)
 
-    // pool2 -> buf32_7
-    this.maxpool2d_into(this.buf32_14, 32, 14, 14, this.buf32_7)
+    // pool2 -> 32x3x3（7/2=3 floor）
+    this.maxpool2d_into(this.buf32_7, 32, 7, 7, this.buf32_3)
 
-    // fc1+relu -> buf128
-    this.fc_relu_into(this.buf32_7, layers[4], this.buf128)
+    // fc1+relu (32*3*3=288) -> 128
+    this.fc_relu_into(this.buf32_3, layers[4], this.buf128)
 
-    // fc2 -> buf36
+    // fc2 (128->36)
     this.fc_into(this.buf128, layers[5], this.buf36)
 
     // argmax
@@ -338,7 +442,7 @@ export default {
     return best
   },
 
-  // ===== conv：专用 1 通道输入版本（避免复制输入、少分支）=====
+  // ===== conv：1 通道输入，支持 w_q/ws 或 wf =====
   conv2d_relu_into_1c(inputHW, H, W, layer, out) {
     const outC = layer.outC | 0
     const kH = layer.kH | 0
@@ -347,11 +451,8 @@ export default {
     const wf = layer.wf
     const wq = layer.w_q
     const ws = layer.w_scale
-
     const b = layer.b
 
-    // out shape: [outC, H, W] CHW
-    // weight layout: [outC, 1, kH, kW] flattened => baseW = oc*kH*kW
     const HW = H * W
     const kHW = kH * kW
 
@@ -365,7 +466,6 @@ export default {
         for (let x = 0; x < W; x++) {
           let sum = bias
 
-          // 3x3 pad=1：保留你原来的边界判断（最小改动）
           for (let ky = 0; ky < kH; ky++) {
             const iy = y + ky - pad
             if (iy < 0 || iy >= H) continue
@@ -385,11 +485,11 @@ export default {
     }
   },
 
-  // conv2 专用快路径：H=W=14, inC=16, outC=32, k=3 pad=1，weights 用 layer.wf
-  conv2_fast_14(inputCHW, layer, out) {
-    const H = 14,
-      W = 14,
-      HW = 196
+  // ===== conv2 快路径：专用 7x7 / inC=16 / outC=32 / k3 pad1，weights 用 wf =====
+  conv2_fast_7(inputCHW, layer, out) {
+    const H = 7,
+      W = 7,
+      HW = 49
     const inC = 16,
       outC = 32
     const wf = layer.wf
@@ -399,10 +499,10 @@ export default {
       const outBase = oc * HW
       const bias = b[oc] || 0.0
 
-      // 中间 12x12 无边界判断（y=1..12, x=1..12）
-      for (let y = 1; y <= 12; y++) {
+      // 中间 5x5（y=1..5,x=1..5）
+      for (let y = 1; y <= 5; y++) {
         const yW = y * W
-        for (let x = 1; x <= 12; x++) {
+        for (let x = 1; x <= 5; x++) {
           let sum = bias
 
           for (let ic = 0; ic < inC; ic++) {
@@ -434,22 +534,22 @@ export default {
         }
       }
 
-      // 边界一圈慢路径（成本很低）
+      // 边界点慢算（只占少量）
       for (let x = 0; x < W; x++) {
-        out[outBase + 0 * W + x] = this.conv2_edge_point(inputCHW, wf, bias, oc, x, 0)
-        out[outBase + 13 * W + x] = this.conv2_edge_point(inputCHW, wf, bias, oc, x, 13)
+        out[outBase + 0 * W + x] = this.conv2_edge_point_7(inputCHW, wf, bias, oc, x, 0)
+        out[outBase + 6 * W + x] = this.conv2_edge_point_7(inputCHW, wf, bias, oc, x, 6)
       }
-      for (let y = 1; y <= 12; y++) {
-        out[outBase + y * W + 0] = this.conv2_edge_point(inputCHW, wf, bias, oc, 0, y)
-        out[outBase + y * W + 13] = this.conv2_edge_point(inputCHW, wf, bias, oc, 13, y)
+      for (let y = 1; y <= 5; y++) {
+        out[outBase + y * W + 0] = this.conv2_edge_point_7(inputCHW, wf, bias, oc, 0, y)
+        out[outBase + y * W + 6] = this.conv2_edge_point_7(inputCHW, wf, bias, oc, 6, y)
       }
     }
   },
 
-  conv2_edge_point(inputCHW, wf, bias, oc, x, y) {
-    const H = 14,
-      W = 14,
-      HW = 196
+  conv2_edge_point_7(inputCHW, wf, bias, oc, x, y) {
+    const H = 7,
+      W = 7,
+      HW = 49
     const inC = 16
     let sum = bias
 
@@ -462,7 +562,6 @@ export default {
         if (iy < 0 || iy >= H) continue
         const iyW = iy * W
         const kRow = (ky + 1) * 3
-
         for (let kx = -1; kx <= 1; kx++) {
           const ix = x + kx
           if (ix < 0 || ix >= W) continue
@@ -473,7 +572,7 @@ export default {
     return sum > 0 ? sum : 0
   },
 
-  // ===== pool：写入外部 out buffer，避免 new =====
+  // ===== pool：写入 out（支持 7->3 floor）=====
   maxpool2d_into(inputCHW, C, H, W, out) {
     const outH = H >> 1
     const outW = W >> 1
@@ -507,7 +606,7 @@ export default {
     }
   },
 
-  // ===== fc：写入外部 out buffer，避免 new；用 wf =====
+  // ===== fc：写入 out buffer =====
   fc_into(input, layer, out) {
     const inSize = layer.inSize | 0
     const outSize = layer.outSize | 0
