@@ -1,0 +1,540 @@
+<template>
+  <div class="root">
+    <text class="btn" onclick="done">done</text>
+
+    <!-- 关键：用一个相对定位容器把 pad 和 overlay 叠在一起 -->
+    <div class="pad-wrap" if="{{ !showGrid }}">
+      <div
+        class="pad"
+        ontouchstart="onDown"
+        ontouchmove="onMove"
+        ontouchend="onUp"
+        ontouchcancel="onUp"
+      ></div>
+    </div>
+    <div class="grid-wrap" if="{{ showGrid }}">
+      <div class="grid-inner">
+        <div
+          for="{{ (i, cell) in preview }}"
+          class="cell {{ cell.on ? 'cell-on' : 'cell-off' }}"
+        ></div>
+      </div>
+    </div>
+    <text class="btn" onclick="clear">clear({{ result }})</text>
+  </div>
+</template>
+<style>
+.btn {
+  font-size: 24px;
+  color: #fff;
+  background-color: #444;
+  padding: 6px;
+}
+.root {
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.pad-wrap {
+  width: 400px;
+  height: 400px;
+  flex-direction: column;
+}
+
+.pad {
+  width: 400px;
+  height: 400px;
+  background-color: #222;
+  border-radius: 12px;
+}
+
+.grid-wrap {
+  width: 400px;
+  height: 400px;
+  justify-content: center;
+  align-items: center;
+}
+
+.grid-inner {
+  width: 280px;
+  height: 280px;
+  flex-direction: row;
+  flex-wrap: wrap;
+}
+
+.cell-off {
+  width: 10px;
+  height: 10px;
+  background-color: #fff;
+}
+
+.cell-on {
+  width: 10px;
+  height: 10px;
+  background-color: #000;
+}
+</style>
+
+<script>
+import rawModel from "../../../models/tiny36_int8_array.json"
+import prompt from "@system.prompt"
+import brightness from "@system.brightness"
+
+export default {
+  private: {
+    // ===== 采集 =====
+    N: 28,
+    padSize: 400,
+    grid: new Uint8Array(28 * 28),
+    preview: [],
+    showGrid: false,
+
+    drawing: false,
+    lastX: 0,
+    lastY: 0,
+
+    sampleIntervalMs: 42,
+    lastSampleTs: 0,
+
+    brush: 1,
+
+    // ===== 结果 =====
+    result: "",
+
+    // ===== 模型 =====
+    model: null,
+    layers: null,
+
+    // ===== 推理缓存（避免频繁 new/GC）=====
+    inputBuf: null, // 28*28
+    buf16_28: null, // 16*28*28
+    buf16_14: null, // 16*14*14
+    buf32_14: null, // 32*14*14
+    buf32_7: null, // 32*7*7
+    buf128: null, // 128
+    buf36: null // 36
+  },
+
+  onInit() {
+    brightness.setKeepScreenOn({keepScreenOn: true})
+
+    const m = rawModel && rawModel.default ? rawModel.default : rawModel
+    this.model = m
+    const layers = m && m.layers ? m.layers : []
+    this.layers = layers
+
+    for (let i = 0; i < layers.length; i++) {
+      const L = layers[i]
+      if (!L) continue
+
+      // bias -> Float32Array
+      if ((L.type === "conv2d" || L.type === "fc") && !(L.b instanceof Float32Array)) {
+        const bsrc = L.b || []
+        const b = new Float32Array(bsrc.length)
+        for (let j = 0; j < b.length; j++) b[j] = +bsrc[j]
+        L.b = b
+      }
+
+      if (L.type === "conv2d") {
+        // 只给 conv2 做 wf（conv1 还用 w_q，否则会变 0）
+        if (L.name === "conv2") {
+          if (!L.wf) {
+            const wsrc = L.w_q || []
+            const ws = +L.w_scale
+            const wf = new Float32Array(wsrc.length)
+            for (let j = 0; j < wf.length; j++) wf[j] = (wsrc[j] | 0) * ws
+            L.wf = wf
+            // conv2 清掉 w_q，省内存
+            L.w_q = null
+            L.w_scale = 1.0
+          }
+        } else {
+          // conv1：保留 w_q（并转 Int16Array 提速）
+          if (!(L.w_q instanceof Int16Array)) {
+            const src = L.w_q || []
+            const wq = new Int16Array(src.length)
+            for (let j = 0; j < wq.length; j++) wq[j] = src[j] | 0
+            L.w_q = wq
+          }
+          L.w_scale = +L.w_scale
+        }
+      } else if (L.type === "fc") {
+        // fc 不生成 wf：w_q -> Int16Array（省内存）
+        if (!(L.w_q instanceof Int16Array)) {
+          const src = L.w_q || []
+          const wq = new Int16Array(src.length)
+          for (let j = 0; j < wq.length; j++) wq[j] = src[j] | 0
+          L.w_q = wq
+        }
+        L.w_scale = +L.w_scale
+        L.inSize = L["in"] | 0
+        L.outSize = L["out"] | 0
+      }
+    }
+
+    // ===== 关键优化 2：预分配所有中间 buffer（infer 不再 new）=====
+    this.inputBuf = new Float32Array(28 * 28)
+    this.buf16_28 = new Float32Array(16 * 28 * 28)
+    this.buf16_14 = new Float32Array(16 * 14 * 14)
+    this.buf32_14 = new Float32Array(32 * 14 * 14)
+    this.buf32_7 = new Float32Array(32 * 7 * 7)
+    this.buf128 = new Float32Array(128)
+    this.buf36 = new Float32Array(36)
+    console.log("layers type:", typeof this.layers)
+    console.log("isArray:", Array.isArray(this.layers))
+  },
+
+  onDestroy() {
+    brightness.setKeepScreenOn({keepScreenOn: false})
+  },
+
+  // ============ UI ============
+  clear() {
+    this.grid.fill(0)
+    this.preview = []
+    this.showGrid = false
+    this.drawing = false
+    this.result = ""
+  },
+
+  onBackPress() {
+    if (this.showGrid) {
+      this.showGrid = false
+      return true
+    }
+    return false
+  },
+
+  done() {
+    prompt.showToast({message: "正在识别..."})
+    const arr = []
+    for (let i = 0; i < 784; i++) arr.push({on: this.grid[i] ? true : false})
+    this.preview = arr
+    this.showGrid = true
+
+    const t0 = Date.now()
+    const idx = this.infer()
+    const ch = this.idxToChar(idx)
+    const ms = Date.now() - t0
+    this.result = ch + "," + ms + "ms"
+    console.log("result:", this.result)
+  },
+
+  // ============ 采集 ============
+  onDown(e) {
+    if (this.showGrid) return
+    if (!e.changedTouches || !e.changedTouches.length) return
+    const t = e.changedTouches[0]
+    this.drawing = true
+    this.lastX = t.offsetX
+    this.lastY = t.offsetY
+    this.lastSampleTs = Date.now()
+    this.drawPoint(this.lastX, this.lastY)
+  },
+
+  onMove(e) {
+    if (this.showGrid) return
+    if (!this.drawing) return
+    if (!e.changedTouches || !e.changedTouches.length) return
+
+    const now = Date.now()
+    if (now - this.lastSampleTs < this.sampleIntervalMs) return
+    this.lastSampleTs = now
+
+    const t = e.changedTouches[0]
+    this.drawLine(this.lastX, this.lastY, t.offsetX, t.offsetY)
+    this.lastX = t.offsetX
+    this.lastY = t.offsetY
+  },
+
+  onUp() {
+    this.drawing = false
+  },
+
+  drawPoint(x, y) {
+    const N = this.N
+    const s = N / this.padSize
+    const gx = (x * s) | 0
+    const gy = (y * s) | 0
+    const r = this.brush | 0
+
+    for (let oy = 0; oy < r; oy++) {
+      for (let ox = 0; ox < r; ox++) {
+        const xx = gx + ox
+        const yy = gy + oy
+        if (xx >= 0 && xx < N && yy >= 0 && yy < N) {
+          this.grid[yy * N + xx] = 255
+        }
+      }
+    }
+  },
+
+  drawLine(x0, y0, x1, y1) {
+    const dx = Math.abs(x1 - x0)
+    const dy = Math.abs(y1 - y0)
+    const steps = Math.max(dx, dy) | 0
+    if (steps <= 0) {
+      this.drawPoint(x0, y0)
+      return
+    }
+    for (let i = 0; i <= steps; i++) {
+      const x = x0 + ((x1 - x0) * i) / steps
+      const y = y0 + ((y1 - y0) * i) / steps
+      this.drawPoint(x, y)
+    }
+  },
+
+  // ============ 推理（优化版：wf/b typed + buffer 复用）===========
+  gridToInputFloat() {
+    const out = this.inputBuf
+    const g = this.grid
+    const N = 28
+    for (let y = 0; y < N; y++) {
+      const row = y * N
+      for (let x = 0; x < N; x++) {
+        // 水平翻转：x -> N-1-x
+        out[row + x] = g[row + (N - 1 - x)] ? 1.0 : 0.0
+      }
+    }
+    return out
+  },
+
+  infer() {
+    const layers = this.layers
+    if (!layers || !layers.length) return 0
+
+    const x0 = this.gridToInputFloat()
+
+    // conv1+relu -> buf16_28
+    this.conv2d_relu_into_1c(x0, 28, 28, layers[0], this.buf16_28)
+
+    // pool1 -> buf16_14
+    this.maxpool2d_into(this.buf16_28, 16, 28, 28, this.buf16_14)
+
+    // conv2+relu -> buf32_14
+    this.conv2_fast_14(this.buf16_14, layers[2], this.buf32_14)
+
+    // pool2 -> buf32_7
+    this.maxpool2d_into(this.buf32_14, 32, 14, 14, this.buf32_7)
+
+    // fc1+relu -> buf128
+    this.fc_relu_into(this.buf32_7, layers[4], this.buf128)
+
+    // fc2 -> buf36
+    this.fc_into(this.buf128, layers[5], this.buf36)
+
+    // argmax
+    const logits = this.buf36
+    let best = 0
+    let bestv = logits[0]
+    for (let i = 1; i < 36; i++) {
+      const v = logits[i]
+      if (v > bestv) {
+        bestv = v
+        best = i
+      }
+    }
+    return best
+  },
+
+  // ===== conv：专用 1 通道输入版本（避免复制输入、少分支）=====
+  conv2d_relu_into_1c(inputHW, H, W, layer, out) {
+    const outC = layer.outC | 0
+    const kH = layer.kH | 0
+    const kW = layer.kW | 0
+    const pad = layer.pad | 0
+    const wf = layer.wf
+    const wq = layer.w_q
+    const ws = layer.w_scale
+
+    const b = layer.b
+
+    // out shape: [outC, H, W] CHW
+    // weight layout: [outC, 1, kH, kW] flattened => baseW = oc*kH*kW
+    const HW = H * W
+    const kHW = kH * kW
+
+    for (let oc = 0; oc < outC; oc++) {
+      const baseOut = oc * HW
+      const baseW = oc * kHW
+      const bias = b[oc] || 0.0
+
+      for (let y = 0; y < H; y++) {
+        const yW = y * W
+        for (let x = 0; x < W; x++) {
+          let sum = bias
+
+          // 3x3 pad=1：保留你原来的边界判断（最小改动）
+          for (let ky = 0; ky < kH; ky++) {
+            const iy = y + ky - pad
+            if (iy < 0 || iy >= H) continue
+            const iyW = iy * W
+            const wRow = baseW + ky * kW
+            for (let kx = 0; kx < kW; kx++) {
+              const ix = x + kx - pad
+              if (ix < 0 || ix >= W) continue
+              const inVal = inputHW[iyW + ix]
+              sum += inVal * (wf ? wf[wRow + kx] : wq[wRow + kx] * ws)
+            }
+          }
+
+          out[baseOut + yW + x] = sum > 0 ? sum : 0
+        }
+      }
+    }
+  },
+
+  // conv2 专用快路径：H=W=14, inC=16, outC=32, k=3 pad=1，weights 用 layer.wf
+  conv2_fast_14(inputCHW, layer, out) {
+    const H = 14,
+      W = 14,
+      HW = 196
+    const inC = 16,
+      outC = 32
+    const wf = layer.wf
+    const b = layer.b
+
+    for (let oc = 0; oc < outC; oc++) {
+      const outBase = oc * HW
+      const bias = b[oc] || 0.0
+
+      // 中间 12x12 无边界判断（y=1..12, x=1..12）
+      for (let y = 1; y <= 12; y++) {
+        const yW = y * W
+        for (let x = 1; x <= 12; x++) {
+          let sum = bias
+
+          for (let ic = 0; ic < inC; ic++) {
+            const inBase = ic * HW
+            const wBase = (oc * inC + ic) * 9
+
+            const p00 = inputCHW[inBase + (yW - W) + (x - 1)]
+            const p01 = inputCHW[inBase + (yW - W) + x]
+            const p02 = inputCHW[inBase + (yW - W) + (x + 1)]
+            const p10 = inputCHW[inBase + yW + (x - 1)]
+            const p11 = inputCHW[inBase + yW + x]
+            const p12 = inputCHW[inBase + yW + (x + 1)]
+            const p20 = inputCHW[inBase + (yW + W) + (x - 1)]
+            const p21 = inputCHW[inBase + (yW + W) + x]
+            const p22 = inputCHW[inBase + (yW + W) + (x + 1)]
+
+            sum += p00 * wf[wBase + 0]
+            sum += p01 * wf[wBase + 1]
+            sum += p02 * wf[wBase + 2]
+            sum += p10 * wf[wBase + 3]
+            sum += p11 * wf[wBase + 4]
+            sum += p12 * wf[wBase + 5]
+            sum += p20 * wf[wBase + 6]
+            sum += p21 * wf[wBase + 7]
+            sum += p22 * wf[wBase + 8]
+          }
+
+          out[outBase + yW + x] = sum > 0 ? sum : 0
+        }
+      }
+
+      // 边界一圈慢路径（成本很低）
+      for (let x = 0; x < W; x++) {
+        out[outBase + 0 * W + x] = this.conv2_edge_point(inputCHW, wf, bias, oc, x, 0)
+        out[outBase + 13 * W + x] = this.conv2_edge_point(inputCHW, wf, bias, oc, x, 13)
+      }
+      for (let y = 1; y <= 12; y++) {
+        out[outBase + y * W + 0] = this.conv2_edge_point(inputCHW, wf, bias, oc, 0, y)
+        out[outBase + y * W + 13] = this.conv2_edge_point(inputCHW, wf, bias, oc, 13, y)
+      }
+    }
+  },
+
+  conv2_edge_point(inputCHW, wf, bias, oc, x, y) {
+    const H = 14,
+      W = 14,
+      HW = 196
+    const inC = 16
+    let sum = bias
+
+    for (let ic = 0; ic < inC; ic++) {
+      const inBase = ic * HW
+      const wBase = (oc * inC + ic) * 9
+
+      for (let ky = -1; ky <= 1; ky++) {
+        const iy = y + ky
+        if (iy < 0 || iy >= H) continue
+        const iyW = iy * W
+        const kRow = (ky + 1) * 3
+
+        for (let kx = -1; kx <= 1; kx++) {
+          const ix = x + kx
+          if (ix < 0 || ix >= W) continue
+          sum += inputCHW[inBase + iyW + ix] * wf[wBase + kRow + (kx + 1)]
+        }
+      }
+    }
+    return sum > 0 ? sum : 0
+  },
+
+  // ===== pool：写入外部 out buffer，避免 new =====
+  maxpool2d_into(inputCHW, C, H, W, out) {
+    const outH = H >> 1
+    const outW = W >> 1
+    const inHW = H * W
+    const outHW = outH * outW
+
+    for (let c = 0; c < C; c++) {
+      const inBase = c * inHW
+      const outBase = c * outHW
+
+      for (let y = 0; y < outH; y++) {
+        const y2 = y << 1
+        const row0 = y2 * W
+        const row1 = (y2 + 1) * W
+        const oy = y * outW
+
+        for (let x = 0; x < outW; x++) {
+          const x2 = x << 1
+
+          let m = inputCHW[inBase + row0 + x2]
+          let v = inputCHW[inBase + row0 + x2 + 1]
+          if (v > m) m = v
+          v = inputCHW[inBase + row1 + x2]
+          if (v > m) m = v
+          v = inputCHW[inBase + row1 + x2 + 1]
+          if (v > m) m = v
+
+          out[outBase + oy + x] = m
+        }
+      }
+    }
+  },
+
+  // ===== fc：写入外部 out buffer，避免 new；用 wf =====
+  fc_into(input, layer, out) {
+    const inSize = layer.inSize | 0
+    const outSize = layer.outSize | 0
+    const wq = layer.w_q
+    const ws = layer.w_scale
+    const b = layer.b
+
+    for (let o = 0; o < outSize; o++) {
+      let sum = b[o] || 0.0
+      const baseW = o * inSize
+      for (let i = 0; i < inSize; i++) sum += input[i] * (wq[baseW + i] * ws)
+      out[o] = sum
+    }
+  },
+
+  fc_relu_into(input, layer, out) {
+    this.fc_into(input, layer, out)
+    for (let i = 0; i < out.length; i++) {
+      const v = out[i]
+      out[i] = v > 0 ? v : 0
+    }
+  },
+
+  idxToChar(idx) {
+    idx = idx | 0
+    if (idx < 10) return String.fromCharCode(48 + idx)
+    return String.fromCharCode(97 + (idx - 10))
+  }
+}
+</script>

@@ -1,0 +1,10 @@
+/.nyc_output
+/coverage
+/node_modules
+/sign
+/dist
+/build
+.husky/
+.stylelintrc.js
+.prettierrc.js
+.eslintignore
